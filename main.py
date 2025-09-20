@@ -14,8 +14,14 @@ from starlette.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 from supabase_rag import init_db_pool
 from supabase_rag import retrieve_topk
+# --- DEBUG: connectivity endpoint (temporary) ---
+import socket
+import traceback
+from urllib.parse import urlparse
 
 load_dotenv()
+
+
 EMBED_SERVICE_URL = os.getenv("EMBED_SERVICE_URL", "http://localhost:8000/embed")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-20b:free") 
@@ -23,6 +29,94 @@ OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "2000")) 
 MAX_CHUNK_CHARS = int(os.getenv("MAX_CHUNK_CHARS", "800"))
 SAFE_TOP_K = int(os.getenv("TOP_K", "4"))
+
+
+
+@app.get("/_debug/connectivity")
+def debug_connectivity():
+    """
+    Perform connectivity checks from inside the running Render container:
+    - show resolved IPs for the embed host
+    - call embed /ready
+    - call embed /embed with a tiny test payload
+    - (optional) try DB connection (if SUPABASE_DATABASE_URL set)
+    Returns JSON (safe to call).
+    Remove this endpoint after debugging.
+    """
+    out = {"host": None, "embed": {}, "db": None, "env": {}}
+    try:
+        out["host"] = socket.gethostname()
+    except Exception as e:
+        out["host"] = f"hostname-error: {e}"
+
+    # Show the environment variable(s) we use (non-secret)
+    try:
+        embed_env = os.getenv("EMBED_SERVICE_URL") or os.getenv("EMBED_SERVICE_BASE") or ""
+        out["env"]["EMBED_SERVICE_URL_present"] = bool(os.getenv("EMBED_SERVICE_URL"))
+        out["env"]["EMBED_SERVICE_BASE_present"] = bool(os.getenv("EMBED_SERVICE_BASE"))
+        out["env"]["EMBED_SERVICE_VALUE"] = embed_env[:300]  # first 300 chars only
+    except Exception as e:
+        out["env"]["error"] = str(e)
+
+    # DNS / IP resolution for embed host
+    try:
+        parsed = urlparse(embed_env) if embed_env else None
+        host = parsed.hostname if parsed else None
+        out["embed"]["host"] = host
+        if host:
+            addrs = socket.getaddrinfo(host, None)
+            ips = sorted({a[4][0] for a in addrs})
+            out["embed"]["resolved_ips"] = ips
+        else:
+            out["embed"]["resolved_ips"] = []
+    except Exception as e:
+        out["embed"]["resolve_error"] = str(e)
+
+    # Call /ready
+    try:
+        ready_url = (embed_env.rstrip("/") + "/ready") if embed_env else ""
+        if not ready_url:
+            out["embed"]["ready"] = {"error": "no_embed_url"}
+        else:
+            r = requests.get(ready_url, timeout=6)
+            out["embed"]["ready"] = {"status": r.status_code, "body_head": r.text[:400]}
+    except Exception as e:
+        out["embed"]["ready"] = {"error": str(e), "trace": traceback.format_exc(limit=3)}
+
+    # Call /embed (small test)
+    try:
+        embed_url = (embed_env.rstrip("/") + "/embed") if embed_env else ""
+        if not embed_url:
+            out["embed"]["post"] = {"error": "no_embed_url"}
+        else:
+            r2 = requests.post(embed_url, json={"texts":["debug from render container"]}, timeout=10)
+            out["embed"]["post"] = {"status": r2.status_code, "body_head": (r2.text or "")[:800]}
+    except Exception as e:
+        out["embed"]["post"] = {"error": str(e), "trace": traceback.format_exc(limit=3)}
+
+    # Optional: try DB quick check (non-secret status)
+    try:
+        dsn = os.getenv("SUPABASE_DATABASE_URL")
+        if not dsn:
+            out["db"] = {"present": False}
+        else:
+            # attempt quick connect but do not leak password in reply
+            try:
+                p = urlparse(dsn)
+                out["db"] = {"present": True, "host": p.hostname, "port": p.port, "db": p.path[1:] if p.path else None, "user": p.username}
+                conn = psycopg2.connect(dsn, sslmode="require", connect_timeout=6)
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                out["db"]["test"] = cur.fetchone()
+                cur.close()
+                conn.close()
+            except Exception as e:
+                out["db"]["error"] = str(e)
+    except Exception as e:
+        out["db"] = {"error": str(e)}
+
+    return out
+# --- end debug endpoint ---
 
 
 @asynccontextmanager
